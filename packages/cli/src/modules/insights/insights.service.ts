@@ -1,6 +1,7 @@
 import type { InsightsSummary } from '@n8n/api-types';
 import { Container, Service } from '@n8n/di';
 import { In } from '@n8n/typeorm';
+import { DateTime } from 'luxon';
 import { Logger } from 'n8n-core';
 import type { ExecutionLifecycleHooks } from 'n8n-core';
 import {
@@ -53,7 +54,7 @@ const shouldSkipMode: Record<WorkflowExecuteMode, boolean> = {
 	manual: true,
 };
 
-type BufferedInsight = Pick<InsightsRaw, 'type' | 'value'> & {
+type BufferedInsight = Pick<InsightsRaw, 'type' | 'value' | 'timestamp'> & {
 	workflowId: string;
 	workflowName: string;
 };
@@ -69,6 +70,8 @@ export class InsightsService {
 	private flushInsightsRawBufferTimer: NodeJS.Timer | undefined;
 
 	private isAsynchronouslySavingInsights = true;
+
+	private flushesInProgress: Set<Promise<void>> = new Set();
 
 	constructor(
 		private readonly sharedWorkflowRepository: SharedWorkflowRepository,
@@ -124,8 +127,9 @@ export class InsightsService {
 		// when remaining workflows are handled during shutdown
 		this.isAsynchronouslySavingInsights = false;
 
-		// Flush remaining events on shutdown
-		await this.flushEvents();
+		// Wait for all in-progress asynchronous flushes
+		// Flush any remaining events
+		await Promise.all([...this.flushesInProgress, this.flushEvents()]);
 	}
 
 	async workflowExecuteAfterHandler(ctx: ExecutionLifecycleHooks, fullRunData: IRun) {
@@ -138,7 +142,9 @@ export class InsightsService {
 		const commonWorkflowData = {
 			workflowId: ctx.workflowData.id,
 			workflowName: ctx.workflowData.name,
+			timestamp: DateTime.utc().toJSDate(),
 		};
+
 		// success or failure event
 		this.bufferedInsights.add({
 			...commonWorkflowData,
@@ -233,6 +239,7 @@ export class InsightsService {
 				insight.metaId = metadata.metaId;
 				insight.type = event.type;
 				insight.value = event.value;
+				insight.timestamp = event.timestamp;
 
 				events.push(insight);
 			}
@@ -242,7 +249,7 @@ export class InsightsService {
 	}
 
 	async flushEvents() {
-		// Prevent flushing if there are no events to flush and we are not forcing it
+		// Prevent flushing if there are no events to flush
 		if (this.bufferedInsights.size === 0) {
 			return;
 		}
@@ -255,19 +262,24 @@ export class InsightsService {
 		const bufferedInsightsToFlush = new Set(this.bufferedInsights);
 		this.bufferedInsights.clear();
 
-		try {
-			await this.saveInsightsMetadataAndRaw(bufferedInsightsToFlush);
-		} catch (e) {
-			this.logger.error('Error while saving insights metadata and raw data', { error: e });
-
-			// If there was an error, we need to re-add the events to the buffer for next flush
-			for (const event of bufferedInsightsToFlush) {
-				this.bufferedInsights.add(event);
+		let flushPromise: Promise<void> | undefined = undefined;
+		flushPromise = (async () => {
+			try {
+				await this.saveInsightsMetadataAndRaw(bufferedInsightsToFlush);
+			} catch (e) {
+				this.logger.error('Error while saving insights metadata and raw data', { error: e });
+				for (const event of bufferedInsightsToFlush) {
+					this.bufferedInsights.add(event);
+				}
+			} finally {
+				this.scheduleFlushing();
+				this.flushesInProgress.delete(flushPromise!);
 			}
-		} finally {
-			// Reinitialize the timer to flush the buffer again
-			this.scheduleFlushing();
-		}
+		})();
+
+		// Add the flush promise to the set of flushes in progress for shutdown await
+		this.flushesInProgress.add(flushPromise);
+		await flushPromise;
 	}
 
 	async compactInsights() {
